@@ -2909,6 +2909,17 @@ impl AppWindow {
                     args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
                     return self.dispatch("space.close", &args, person, window, cx);
                 }
+                // A tab with running terminals asks first, like closing its
+                // space does; empty panes and finished work close at once.
+                if a.get("confirmed").and_then(Value::as_bool) != Some(true)
+                    && let Some(detail) = self.stopped_by_tab(&id)
+                {
+                    if !person {
+                        return self.fail("tab.close ends running terminals: pass confirmed: true");
+                    }
+                    self.confirm("Close tab?", &detail, "tab.close", json!({ "id": id, "confirmed": true }), window, cx);
+                    return;
+                }
                 let (addrs, _) = self.model.remove_tab(&id);
                 self.kill(&addrs, cx);
             }
@@ -2975,8 +2986,24 @@ impl AppWindow {
                     return;
                 }
                 if c.root.panes().len() == 1 {
-                    let id = c.id.clone();
-                    return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
+                    // Closing the last pane closes the tab: let it ask (or a
+                    // confirmed close carry through), like closing the tab does.
+                    let mut args = json!({ "id": c.id.clone() });
+                    args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
+                    return self.dispatch("tab.close", &args, person, window, cx);
+                }
+                // A pane whose terminal still runs asks first, like closing its
+                // space does; mod panes and finished terminals close at once.
+                if a.get("confirmed").and_then(Value::as_bool) != Some(true)
+                    && let Some(addr) = self.model.address_of(&pane).filter(|addr| runs(&self.live, addr))
+                {
+                    if !person {
+                        return self.fail("pane.close ends a running terminal: pass confirmed: true");
+                    }
+                    let title = self.live.get(&addr).and_then(|r| r.get("title")).and_then(Value::as_str).map(str::to_owned)
+                        .unwrap_or_else(|| "its terminal".to_owned());
+                    self.confirm("Close pane?", &format!("{title} \u{2014} still running"), "pane.close", json!({ "pane": pane, "confirmed": true }), window, cx);
+                    return;
                 }
                 let addr = self.model.address_of(&pane);
                 self.model.remove_pane(&pane);
@@ -3469,6 +3496,19 @@ impl AppWindow {
     }
 
     // ---- overlays ----------------------------------------------------------
+
+    /// What closing a tab would stop, or None when none of its terminals
+    /// runs: mods and blank panes have no terminal, and a finished one takes
+    /// its pane with it, so those close without asking.
+    fn stopped_by_tab(&self, id: &str) -> Option<String> {
+        let p = self.model.space_of(id)?;
+        let c = self.model.tab(id)?;
+        let running = model::addresses(&c.root).iter().filter(|a| runs(&self.live, a)).count();
+        if running == 0 {
+            return None;
+        }
+        Some(format!("{} \u{2014} {} running terminal{}", Model::tab_name(p, c), running, if running == 1 { "" } else { "s" }))
+    }
 
     fn confirm(&mut self, title: &str, detail: &str, command: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
         let spec = json!({ "mod": "confirm", "kind": "dialog", "width": 380,
@@ -4702,6 +4742,13 @@ fn running_argv(rec: &serde_json::Map<String, Value>) -> Option<&Value> {
     rec.get("foreground").and_then(|f| f.get("argv")).filter(|a| a.as_array().is_some_and(|a| !a.is_empty())).or_else(|| rec.get("argv"))
 }
 
+/// Whether the core's record still has a terminal running: closing its pane
+/// or tab would end it. A program that ended takes its pane with it, and a
+/// mod pane has no terminal, so a close asks only when this holds.
+fn runs(live: &HashMap<String, Value>, address: &str) -> bool {
+    live.get(address).is_some_and(|r| r["state"] == "live")
+}
+
 /// Whether the core's record still puts a terminal in this space and tab and
 /// it still runs. A listing taken just before it ended still shows it running,
 /// and labels outlive the program: putting it back would show a dead pane.
@@ -5022,6 +5069,19 @@ mod tests {
         assert_eq!(super::new_space_machine(&json!({}), true, &model), None);
         model.active = Some("remote".into());
         assert_eq!(super::new_space_machine(&json!({}), true, &model).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn closes_ask_only_for_terminals_still_running() {
+        use std::collections::HashMap;
+        use serde_json::json;
+        let mut live = HashMap::new();
+        live.insert("t1".to_owned(), json!({ "state": "live", "title": "claude" }));
+        live.insert("t2".to_owned(), json!({ "state": "ended" }));
+        live.insert("t3".to_owned(), json!({}));
+        for (address, ask) in [("t1", true), ("t2", false), ("t3", false), ("t4", false)] {
+            assert_eq!(super::runs(&live, address), ask, "{address}");
+        }
     }
 
     #[gpui::test]
